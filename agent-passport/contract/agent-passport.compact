@@ -1,0 +1,114 @@
+// Agent Passport: a registry that lets an AI agent show it is backed by an
+// enrolled human, without showing which human.
+//
+//   issuer  enrols a human's holder key (a hash of the human's secret).
+//   human   authorises up to 3 agent keys. The proof shows "I am one of the
+//           enrolled holders" and publishes a per-slot nullifier, never the
+//           holder key. Nobody, the issuer included, can tell which holder
+//           stands behind which agent.
+//   agent   answers a verifier's challenge on chain, proving it holds the
+//           secret behind an authorised agent key.
+//   human   revokes an agent by slot, which frees the slot.
+//
+// Based on the membership-proof and nullifier pattern in the official voting
+// example (midnightntwrk/midnight-examples, Apache-2.0).
+pragma language_version 0.28;
+import CompactStandardLibrary;
+
+export sealed ledger issuerPk: Bytes<32>;
+// Enrolled holder keys. Historic, so a proof made against a recent root still
+// verifies if someone else is enrolled before the transaction lands.
+export ledger holders: HistoricMerkleTree<10, Bytes<32>>;
+export ledger holderKeys: Set<Bytes<32>>;
+export ledger enrolled: Counter;
+// Authorised agent keys: the public answer to "is this agent backed by a human?"
+export ledger agents: Set<Bytes<32>>;
+// Slot nullifier -> the agent key occupying that slot.
+export ledger slots: Map<Bytes<32>, Bytes<32>>;
+// Verifier challenge -> the agent key that answered it.
+export ledger attestations: Map<Bytes<32>, Bytes<32>>;
+
+witness secretKey(): Bytes<32>;
+witness holderPath(pk: Bytes<32>): MerkleTreePath<10, Bytes<32>>;
+
+struct SlotPreimage {
+  tag: Bytes<32>,
+  sk: Bytes<32>,
+  slot: Uint<8>,
+  instance: Bytes<32>
+}
+
+constructor() {
+  issuerPk = disclose(issuerKey(secretKey()));
+}
+
+// One domain-separated key per role, so a secret used in one role can't be
+// replayed in another.
+export pure circuit issuerKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "agent-passport:issuer"), sk]);
+}
+export pure circuit holderKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "agent-passport:holder"), sk]);
+}
+export pure circuit agentKey(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "agent-passport:agent"), sk]);
+}
+// Bound to the slot and to this contract instance: two slots of one human
+// can't be linked to each other, and neither can the same human's slots in
+// two deployments.
+export pure circuit slotNullifier(sk: Bytes<32>, slot: Uint<8>, instance: Bytes<32>): Bytes<32> {
+  return persistentHash<SlotPreimage>(SlotPreimage {
+    tag: pad(32, "agent-passport:slot"),
+    sk: sk,
+    slot: slot,
+    instance: instance
+  });
+}
+
+// Proves the caller is an enrolled holder and returns their secret for the
+// nullifier. Nothing here is disclosed except "the path is valid".
+circuit requireHolder(): Bytes<32> {
+  const sk = secretKey();
+  const path = holderPath(holderKey(sk));
+  assert(disclose(path.leaf == holderKey(sk)), "Path is not for this holder");
+  assert(holders.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path))), "Not an enrolled holder");
+  return sk;
+}
+
+export circuit enrol(pk: Bytes<32>): [] {
+  assert(disclose(issuerKey(secretKey())) == issuerPk, "Only the issuer can do this");
+  const k = disclose(pk);
+  assert(!holderKeys.member(k), "Holder already enrolled");
+  assert(enrolled.read() < 1024, "Registry is full");
+  holderKeys.insert(k);
+  holders.insert(k);
+  enrolled.increment(1);
+}
+
+export circuit authorise(agent: Bytes<32>, slot: Uint<8>): [] {
+  const sk = requireHolder();
+  assert(disclose(slot < 3), "A holder has 3 agent slots");
+  const n = disclose(slotNullifier(sk, slot, kernel.self().bytes));
+  assert(!slots.member(n), "Slot already in use");
+  const a = disclose(agent);
+  assert(!agents.member(a), "Agent already authorised");
+  slots.insert(n, a);
+  agents.insert(a);
+}
+
+// No membership proof needed: only the holder's secret produces a nullifier
+// that is in `slots`.
+export circuit revoke(slot: Uint<8>): [] {
+  const n = disclose(slotNullifier(secretKey(), slot, kernel.self().bytes));
+  assert(slots.member(n), "Slot is empty");
+  agents.remove(slots.lookup(n));
+  slots.remove(n);
+}
+
+export circuit attest(challenge: Bytes<32>): [] {
+  const a = disclose(agentKey(secretKey()));
+  assert(agents.member(a), "Not an authorised agent");
+  const c = disclose(challenge);
+  assert(!attestations.member(c), "Challenge already answered");
+  attestations.insert(c, a);
+}
